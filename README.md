@@ -16,6 +16,7 @@ Ghostty의 창·탭·분할을 그 안에서 돌던 세션과 함께 저장했�
 
 ```bash
 brew tap hiddenpunch/tap
+brew trust --formula hiddenpunch/tap/termsnap   # 외부 tap 은 한 번 신뢰 등록이 필요하다
 brew install termsnap
 brew services start termsnap     # 5분마다 자동 저장, 로그인 시 자동 시작
 ```
