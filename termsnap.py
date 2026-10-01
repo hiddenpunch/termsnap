@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Ghostty 창·탭·분할과 그 안의 세션(Claude Code, Codex, 기타 명령)을 저장하고 되살린다.
+"""Ghostty·iTerm2·tmux 의 창·탭·분할과 그 안의 세션(Claude Code, Codex, 기타 명령)을 저장하고 되살린다.
 
   termsnap snapshot [--quiet]                지금 상태를 ~/.termsnap/ 에 저장
   termsnap show [저장본|--latest]             저장본 내용 보기
@@ -170,31 +170,213 @@ def codex_info(pid, procs):
 HELPER = re.compile(r"mcp|notify-hub|node_repl|caffeinate|trusted-worker|kernel\.js|codex sandbox|app-server|code-mode-host")
 
 
+def entry_for(tty, shell, procs, cwds, fallback_cwd=None):
+    """tty 와 그 셸 프로세스로 분할 하나의 정보를 만든다. Ghostty·tmux 가 함께 쓴다."""
+    ent = {"tty": tty, "shell_cwd": (cwds.get(shell["pid"]) if shell else None) or fallback_cwd, "kind": "shell", "cmd": None,
+           "cwd": None, "session": None, "titles": [], "resume": None}
+    if not shell:
+        return ent
+    kids = [p for p in procs.values() if p["ppid"] == shell["pid"] and not HELPER.search(p["cmd"])]
+    main = min(kids, key=lambda p: p["pid"]) if kids else None
+    if main:
+        ent.update(cmd=main["cmd"], cwd=cwds.get(main["pid"]) or ent["shell_cwd"])
+        first = os.path.basename(main["cmd"].split()[0])
+        if first == "claude":
+            ent.update(kind="claude", **claude_info(main["pid"], main["cmd"], ent["cwd"]))
+        elif "codex" in main["cmd"].split()[:2][-1] or first == "codex":
+            ent.update(kind="codex", **codex_info(main["pid"], procs))
+        else:
+            ent.update(kind="other", resume=main["cmd"], titles=[main["cmd"], first])
+    return ent
+
+
+def shells_and_mains(shells, procs):
+    """셸들과 그 첫 자식 프로세스의 작업 폴더를 lsof 한 번으로 구한다."""
+    pids = []
+    for sh_ in shells:
+        if sh_:
+            pids.append(sh_["pid"])
+            pids += [p["pid"] for p in procs.values() if p["ppid"] == sh_["pid"] and not HELPER.search(p["cmd"])][:1]
+    return cwd_map(pids)
+
+
 def terminal_processes(ghostty_pid, procs):
     """Ghostty 의 분할 하나 = login 프로세스 하나. 각 분할에서 돌던 것을 뽑는다."""
     found = []
     for lg in (p for p in procs.values() if p["ppid"] == ghostty_pid and p["cmd"].startswith("/usr/bin/login")):
         shell = next((p for p in procs.values() if p["ppid"] == lg["pid"]), None)
-        if not shell:
-            continue
-        kids = [p for p in procs.values() if p["ppid"] == shell["pid"] and not HELPER.search(p["cmd"])]
-        found.append((lg, shell, min(kids, key=lambda p: p["pid"]) if kids else None))
-    cwds = cwd_map([x["pid"] for _, shell, main in found for x in (shell, main) if x])
+        if shell:
+            found.append((lg, shell))
+    cwds = shells_and_mains([shell for _, shell in found], procs)
+    return [entry_for(lg["tty"], shell, procs, cwds) for lg, shell in found]
+
+
+# ---------- iTerm2 ----------
+ITERM_BIN = "/iTerm.app/Contents/MacOS/iTerm2"
+
+
+def tty_shell(tty, procs):
+    """tty 에서 돌던 로그인 셸을 찾는다: login 의 자식, 없으면 이름이 - 로 시작하는 셸, 없으면 가장 먼저 뜬 프로세스."""
+    on = [p for p in procs.values() if p["tty"] == tty]
+    login = next((p for p in on if p["cmd"].startswith("/usr/bin/login")), None)
+    if login:
+        kid = next((p for p in on if p["ppid"] == login["pid"]), None)
+        if kid:
+            return kid
+    dash = [p for p in on if p["cmd"].startswith("-")]
+    return min(dash or on, key=lambda p: p["pid"]) if (dash or on) else None
+
+
+def iterm_layout(procs):
+    """iTerm2 창·탭·세션(분할)을 읽는다. iTerm2 가 꺼져 있으면 묻지 않는다(물으면 켜진다)."""
+    if not any(p["cmd"].endswith(ITERM_BIN) for p in procs.values()):
+        return []
+    script = '''
+    set sep to (character id 31)
+    set out to ""
+    tell application "iTerm"
+      repeat with w in windows
+        set out to out & "W" & sep & (id of w) & linefeed
+        set ti to 0
+        repeat with t in tabs of w
+          set ti to ti + 1
+          set out to out & "T" & sep & ti & sep & (name of current session of t) & linefeed
+          repeat with s in sessions of t
+            set out to out & "S" & sep & (id of s) & sep & (tty of s) & sep & (name of s) & linefeed
+          end repeat
+        end repeat
+      end repeat
+    end tell
+    return out'''
+    rows, windows = [], []
+    for line in osa(script).splitlines():
+        p = line.split(SEP)
+        if p[0] == "W":
+            windows.append({"app": "iterm2", "id": p[1], "name": f"iTerm2 {p[1]}", "tabs": []})
+        elif p[0] == "T":
+            windows[-1]["tabs"].append({"index": int(p[1]), "selected": False, "name": SEP.join(p[2:]), "terminals": []})
+        elif p[0] == "S":
+            tty = p[2].replace("/dev/", "")
+            windows[-1]["tabs"][-1]["terminals"].append({"id": p[1], "tty": tty, "title": SEP.join(p[3:])})
+    shells = {t["tty"]: tty_shell(t["tty"], procs) for w in windows for tab in w["tabs"] for t in tab["terminals"]}
+    cwds = shells_and_mains(list(shells.values()), procs)
+    for w in windows:
+        for tab in w["tabs"]:
+            for t in tab["terminals"]:
+                sh_ = shells.get(t["tty"])
+                t["proc"] = entry_for(t["tty"], sh_, procs, cwds)
+                t["cwd"] = t["proc"]["shell_cwd"] or HOME
+    return windows
+
+
+def restore_iterm(windows, run_all=False, dry_run=False):
+    import shlex
+    if not windows:
+        return True
+    lines = ['tell application "iTerm"', "activate"]
+    def write(cwd, cmd, auto):
+        out = [f"tell s to write text {q('cd ' + shlex.quote(cwd) + (' && ' + cmd if cmd and (auto or run_all) else ''))}"]
+        if cmd and not (auto or run_all):
+            out.append(f"tell s to write text {q(cmd)} newline NO")   # 입력만 해 둔다
+        return out
+    for w in windows:
+        for ti, tab in enumerate(w["tabs"]):
+            for si, t in enumerate(tab["terminals"]):
+                cmd, auto = command_for(t)
+                if ti == 0 and si == 0:
+                    lines += ["set win to (create window with default profile)", "set s to current session of win"]
+                elif si == 0:
+                    lines += ["tell win to set tb to (create tab with default profile)", "set s to current session of tb"]
+                else:
+                    lines.append("tell s to set s to (split vertically with default profile)")
+                lines += write(t["cwd"], cmd, auto)
+    lines.append("end tell")
+    script = "\n".join(lines)
+    if dry_run:
+        print(script)
+        return True
+    r = subprocess.run(["osascript", "-"], input=script, capture_output=True, text=True)
+    if r.returncode != 0:
+        print("iTerm2 복원 실패:", r.stderr.strip())
+    return r.returncode == 0
+
+
+# ---------- tmux ----------
+def tmux_bin():
+    return next((b for b in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux") if os.access(b, os.X_OK)), None)
+
+
+def tmux_layout(procs):
+    """tmux 세션 = 창, tmux 창 = 탭, pane = 분할로 맞춰 읽는다. 서버가 없으면 빈 목록."""
+    tm = tmux_bin()
+    if not tm:
+        return []
+    D = "|~|"   # LC_ALL=C 에서는 tmux 가 제어 문자를 _ 로 바꾸므로 일반 문자로 구분한다
+    fmt = D.join(["#{session_name}", "#{window_index}", "#{window_name}", "#{window_layout}", "#{window_active}",
+                    "#{pane_index}", "#{pane_tty}", "#{pane_current_path}", "#{pane_pid}", "#{pane_title}"])
+    r = subprocess.run([tm, "list-panes", "-a", "-F", fmt], capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    rows = [l.split(D) for l in r.stdout.splitlines() if l.count(D) == 9]
+    shells = {int(x[8]): procs.get(int(x[8])) for x in rows}
+    cwds = shells_and_mains(list(shells.values()), procs)
+    sessions = {}
+    for sess, widx, wname, layout, wact, pidx, tty, path, ppid, ptitle in rows:
+        s = sessions.setdefault(sess, {"app": "tmux", "id": sess, "name": sess, "tabs": {}})
+        tab = s["tabs"].setdefault(int(widx), {"index": int(widx), "name": wname, "layout": layout, "selected": wact == "1", "terminals": []})
+        ent = entry_for(tty.replace("/dev/", ""), shells.get(int(ppid)), procs, cwds, fallback_cwd=path)
+        tab["terminals"].append({"id": f"{sess}:{widx}.{pidx}", "cwd": path, "title": ptitle or wname, "proc": ent})
     out = []
-    for lg, shell, main in found:
-        ent = {"tty": lg["tty"], "shell_cwd": cwds.get(shell["pid"]), "kind": "shell", "cmd": None, "cwd": None, "session": None,
-               "titles": [], "resume": None}
-        if main:
-            ent.update(cmd=main["cmd"], cwd=cwds.get(main["pid"]))
-            first = os.path.basename(main["cmd"].split()[0])
-            if first == "claude":
-                ent.update(kind="claude", **claude_info(main["pid"], main["cmd"], ent["cwd"]))
-            elif "codex" in main["cmd"].split()[:2][-1] or first == "codex":
-                ent.update(kind="codex", **codex_info(main["pid"], procs))
-            else:
-                ent.update(kind="other", resume=main["cmd"], titles=[main["cmd"], first])
-        out.append(ent)
+    for s in sessions.values():
+        tabs = [s["tabs"][k] for k in sorted(s["tabs"])]
+        for tab in tabs:
+            tab["pane_count"] = len(tab["terminals"])
+        out.append({**s, "tabs": tabs})
     return out
+
+
+def restore_tmux(sessions, run_all=False, dry_run=False):
+    """저장한 tmux 세션을 다시 만든다. 같은 이름의 세션이 이미 있으면 이름 뒤에 -2, -3 을 붙인다."""
+    tm = tmux_bin()
+    if not sessions:
+        return True
+    if not tm:
+        print("tmux 가 없어 tmux 세션은 복원하지 못했습니다")
+        return False
+    def run(args):
+        if dry_run:
+            print(" ".join(q(a) if " " in a else a for a in args))
+            return "%0" if "pane_id" in args[-1] else "dry:0 %0"
+        return subprocess.run([tm] + args, capture_output=True, text=True).stdout.strip()
+    existing = set(subprocess.run([tm, "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True).stdout.split())
+    for s in sessions:
+        name, n = s["name"], 2
+        while name in existing:
+            name, n = f"{s['name']}-{n}", n + 1
+        existing.add(name)
+        for i, tab in enumerate(s["tabs"]):
+            panes = tab["terminals"]
+            fmt = "#{session_name}:#{window_index} #{pane_id}"
+            if i == 0:
+                m = re.match(r"[0-9a-f]+,(\d+)x(\d+),", tab.get("layout") or "")
+                w_, h_ = (m.group(1), m.group(2)) if m else ("240", "60")   # 저장할 때 크기로 만들어야 배치가 그대로 맞는다
+                out = run(["new-session", "-d", "-x", w_, "-y", h_, "-s", name, "-n", tab["name"], "-c", panes[0]["cwd"], "-P", "-F", fmt])
+            else:
+                out = run(["new-window", "-t", f"{name}:", "-n", tab["name"], "-c", panes[0]["cwd"], "-P", "-F", fmt])
+            target, first = out.split()[0], out.split()[-1]
+            ids = [first]
+            for p in panes[1:]:
+                ids.append(run(["split-window", "-t", target, "-c", p["cwd"], "-P", "-F", "#{pane_id}"]))
+                run(["select-layout", "-t", target, "tiled"])   # 여러 번 나눠도 자리가 모자라지 않게
+            if tab.get("layout") and len(panes) == tab.get("pane_count", len(panes)):
+                run(["select-layout", "-t", target, tab["layout"]])   # 원래 분할 방향·비율 그대로
+            for pid_, t in zip(ids, panes):
+                cmd, auto = command_for(t)
+                if cmd:
+                    run(["send-keys", "-t", pid_, "-l", cmd])
+                    if auto or run_all:
+                        run(["send-keys", "-t", pid_, "Enter"])
+    return True
 
 
 # ---------- 짝짓기 ----------
@@ -239,8 +421,11 @@ ALERT_CAUSES = ("reboot", "login", "crash")   # 이 경로로 사라졌을 때�
 CAUSE_KO = {"reboot": "재부팅", "login": "로그아웃 후 로그인", "crash": "Ghostty 충돌", "quit": "Ghostty 종료", "closed": "창 닫음"}
 
 
+GROUPS = ("windows", "tmux", "iterm2")   # windows = Ghostty
+
+
 def terms_of(snap):
-    return [t for w in snap.get("windows", []) for tab in w["tabs"] for t in tab["terminals"]]
+    return [t for g in GROUPS for w in snap.get(g, []) for tab in w["tabs"] for t in tab["terminals"]]
 
 
 def key_of(t):
@@ -256,22 +441,25 @@ def keys_of(snap):
 def only_missing(target, live):
     """target 에서, 지금 살아 있는 분할과 같은 것을 뺀 저장본을 만든다. 비는 탭·창은 없앤다."""
     left = keys_of(live)
-    windows = []
-    for w in target["windows"]:
-        tabs = []
-        for tab in w["tabs"]:
-            keep = []
-            for t in tab["terminals"]:
-                k = key_of(t)
-                if k in left:
-                    left.remove(k)
-                else:
-                    keep.append(t)
-            if keep:
-                tabs.append({**tab, "terminals": keep})
-        if tabs:
-            windows.append({**w, "tabs": tabs})
-    return {**target, "windows": windows}
+    out = dict(target)
+    for g in GROUPS:
+        windows = []
+        for w in target.get(g, []):
+            tabs = []
+            for tab in w["tabs"]:
+                keep = []
+                for t in tab["terminals"]:
+                    k = key_of(t)
+                    if k in left:
+                        left.remove(k)
+                    else:
+                        keep.append(t)
+                if keep:
+                    tabs.append({**tab, "terminals": keep})
+            if tabs:
+                windows.append({**w, "tabs": tabs})
+        out[g] = windows
+    return out
 
 
 def close_terminals(terms):
@@ -289,10 +477,21 @@ def close_terminals(terms):
                            capture_output=True)
 
 
+def close_all(live):
+    """지금 열린 터미널을 모두 닫는다: Ghostty 분할은 HUP, tmux 는 세션을 끝낸다."""
+    close_terminals([t for g in ("windows", "iterm2") for w in live.get(g, []) for tab in w["tabs"] for t in tab["terminals"]])
+    tm = tmux_bin()
+    for s in live.get("tmux", []):
+        if tm:
+            subprocess.run([tm, "kill-session", "-t", s["name"]], capture_output=True)
+
+
 def counts(snap):
     ts = terms_of(snap)
     kinds = [(t.get("proc") or {}).get("kind") for t in ts]
-    return {"windows": len(snap.get("windows", [])), "tabs": sum(len(w["tabs"]) for w in snap.get("windows", [])),
+    wins = [w for g in GROUPS for w in snap.get(g, [])]
+    return {"windows": len(wins), "tabs": sum(len(w["tabs"]) for w in wins),
+            "tmux": sum(len(tab["terminals"]) for w in snap.get("tmux", []) for tab in w["tabs"]),
             "terminals": len(ts), "claude": kinds.count("claude"), "codex": kinds.count("codex"),
             "other": len(ts) - kinds.count("claude") - kinds.count("codex"),
             "busy": sum(1 for t in ts if (t.get("proc") or {}).get("busy"))}
@@ -362,7 +561,7 @@ def detect_loss(prev, cur, ghostty_running, procs):
 def fingerprint(snap):
     """구조와 분할별 폴더·세션만 본다. 제목은 작업 중 표시 때문에 계속 바뀌어서 뺀다."""
     return [[[(t["cwd"], (t.get("proc") or {}).get("kind"), (t.get("proc") or {}).get("session"), (t.get("proc") or {}).get("resume"))
-              for t in tab["terminals"]] for tab in w["tabs"]] for w in snap.get("windows", [])]
+              for t in tab["terminals"]] for tab in w["tabs"]] for g in GROUPS for w in snap.get(g, [])]
 
 
 # ---------- 명령 ----------
@@ -373,7 +572,8 @@ def snapshot():
     # Ghostty 가 꺼져 있을 때 osascript 로 물으면 Ghostty 가 켜지므로 묻지 않는다
     windows = ghostty_layout() if gpid else []
     unmatched = match(windows, terminal_processes(gpid, procs)) if gpid else []
-    snap = {"taken_at": dt.datetime.now().isoformat(timespec="seconds"), "windows": windows, "unmatched": unmatched}
+    snap = {"taken_at": dt.datetime.now().isoformat(timespec="seconds"), "windows": windows, "unmatched": unmatched,
+            "tmux": tmux_layout(procs), "iterm2": iterm_layout(procs)}
     prev = read_json(LATEST)
     detect_loss(prev, snap, bool(gpid), procs)
     write_json(snap, LATEST)
@@ -390,14 +590,15 @@ def command_for(term):
     p = term.get("proc")
     if not p or p["kind"] == "shell" or not p["resume"]:
         return None, False
-    return p["resume"], p["kind"] in AUTORUN
+    return p["resume"], p["kind"] in AUTORUN or (p["kind"] == "other" and os.path.basename(p["resume"].split()[0]) == "tmux")
 
 
 def show(snap):
     n = m = 0
     print(f"저장 시각 {snap['taken_at']}")
-    for wi, w in enumerate(snap["windows"], 1):
-        print(f"창 {wi}")
+    wins = [(g, w) for g in GROUPS for w in snap.get(g, [])]
+    for wi, (g, w) in enumerate(wins, 1):
+        print({"windows": f"Ghostty 창 {wi}", "tmux": f"tmux 세션 {w['name']}", "iterm2": f"iTerm2 창 {w['id']}"}[g])
         for tab in w["tabs"]:
             print(f"  탭 {tab['index']} [{tab['name']}]")
             for t in tab["terminals"]:
@@ -478,6 +679,11 @@ def q(s):
 
 
 def restore(snap, dry_run=False, run_all=False):
+    ok = restore_tmux(snap.get("tmux", []), run_all=run_all, dry_run=dry_run)   # Ghostty 분할의 tmux attach 가 붙을 세션을 먼저 만든다
+    ok = restore_iterm(snap.get("iterm2", []), run_all=run_all, dry_run=dry_run) and ok
+    if not snap.get("windows"):
+        print("복원 완료" if ok else "복원 실패")
+        return ok
     lines = ['tell application "Ghostty"', "activate"]
     for w in snap["windows"]:
         first_tab = True
@@ -503,8 +709,8 @@ def restore(snap, dry_run=False, run_all=False):
         print(script)
         return
     r = subprocess.run(["osascript", "-"], input=script, capture_output=True, text=True)
-    print("복원 완료" if r.returncode == 0 else "복원 실패", r.stderr.strip())
-    return r.returncode == 0
+    print("복원 완료" if r.returncode == 0 and ok else "복원 실패", r.stderr.strip())
+    return r.returncode == 0 and ok
 
 
 if __name__ == "__main__":
@@ -529,7 +735,7 @@ if __name__ == "__main__":
                 import signal
                 signal.signal(signal.SIGHUP, signal.SIG_IGN)   # 이 명령을 실행한 터미널이 닫혀도 복원은 끝까지 한다
                 json.dump(live, open(os.path.join(STATE, "before-replace.json"), "w"), ensure_ascii=False, indent=1)
-                close_terminals(terms_of(live))
+                close_all(live)
                 import time
                 time.sleep(2)
         if not terms_of(target):

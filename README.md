@@ -1,6 +1,6 @@
 # termsnap
 
-Ghostty의 창·탭·분할을 그 안에서 돌던 세션과 함께 저장했다가, 재부팅이나 충돌 뒤에 그대로 되살린다. Claude Code와 Codex는 각자 대화를 이어간다.
+Ghostty·iTerm2·tmux의 창·탭·분할을 그 안에서 돌던 세션과 함께 저장했다가, 재부팅이나 충돌 뒤에 그대로 되살린다. Claude Code와 Codex는 각자 대화를 이어간다.
 
 ```text
 재부팅 → termsnap restore → 창 2개 · 탭 17개 · 분할 32개가 원래 폴더에서 열리고
@@ -9,7 +9,8 @@ Ghostty의 창·탭·분할을 그 안에서 돌던 세션과 함께 저장했�
 
 ## 필요한 것
 
-- macOS, [Ghostty](https://ghostty.org) 1.3 이상 (AppleScript 지원)
+- macOS
+- 아래 터미널 중 하나 이상: [Ghostty](https://ghostty.org) 1.3 이상, [iTerm2](https://iterm2.com), [tmux](https://github.com/tmux/tmux)
 - Homebrew (설치되어 있으면 macOS 기본 파이썬도 함께 있다)
 
 ## 설치
@@ -21,7 +22,7 @@ brew install termsnap
 brew services start termsnap     # 5분마다 자동 저장, 로그인 시 자동 시작
 ```
 
-처음 저장할 때 macOS가 Ghostty 제어 권한을 묻는다. 허용해야 창 구조를 읽을 수 있다.
+처음 저장할 때 macOS가 Ghostty·iTerm2 제어 권한을 묻는다. 허용해야 창 구조를 읽을 수 있다.
 
 ## 쓰는 법
 
@@ -51,7 +52,7 @@ termsnap restore --dry-run        # 열지 않고 실행될 내용만 보기
 | 재부팅 | 부팅 시각이 직전 저장보다 뒤 |
 | 로그아웃 후 로그인 | 로그인 시각이 직전 저장보다 뒤 |
 | Ghostty 충돌 | 직전 저장 뒤에 Ghostty 충돌 보고서가 생김 |
-| Ghostty 종료, 창 닫음 | 그 외 |
+| 터미널 종료, 창 닫음 | 그 외 |
 
 ## 메뉴 막대 앱
 
@@ -79,11 +80,16 @@ xattr -dr com.apple.quarantine /Applications/Termsnap.app
 
 ## 동작 방식과 한계
 
-- Ghostty AppleScript로 창·탭·분할 구조와 분할별 제목·폴더를 읽고, 복원할 때 같은 구조를 새로 만든다.
+| 터미널 | 구조 읽기 | 분할과 세션 짝짓기 | 복원 |
+|---|---|---|---|
+| Ghostty | AppleScript | 터미널 제목과 폴더 | 분할은 모두 오른쪽으로 나뉜다 |
+| iTerm2 | AppleScript | 세션의 tty (정확) | 분할은 모두 세로로 나뉜다 |
+| tmux | `tmux list-panes` | pane 의 tty (정확) | 분할 방향과 크기까지 원래대로. 같은 이름의 세션이 있으면 이름 뒤에 `-2` 를 붙인다 |
+
 - 분할마다 돌던 프로세스는 `ps`·`lsof` 로 찾는다. Claude Code 세션 ID는 `~/.claude/sessions/`, Codex 세션 ID는 `~/.codex/sessions/` 의 기록 파일에서 읽는다.
-- 분할과 프로세스는 터미널 제목과 폴더로 짝짓는다. Claude Code는 대화 제목이 터미널 제목에 나와서 같은 폴더에 여러 개 있어도 구분된다. 같은 폴더의 Codex 두 개는 서로 바뀔 수 있다.
-- 분할의 방향과 비율은 Ghostty AppleScript가 알려 주지 않아서 모두 오른쪽으로 나뉜다.
-- Claude Code·Codex의 내부 파일과 Ghostty AppleScript 사전은 공식 API가 아니라서 업데이트로 바뀌면 깨질 수 있다.
+- Ghostty 는 분할마다 어떤 프로세스가 도는지 알려 주지 않아 제목과 폴더로 짝짓는다. Claude Code는 대화 제목이 터미널 제목에 나와서 같은 폴더에 여러 개 있어도 구분된다. 같은 폴더의 Codex 두 개는 서로 바뀔 수 있다.
+- Ghostty 안에서 tmux 를 쓰면 tmux 세션을 먼저 되살리고, Ghostty 분할의 `tmux attach` 를 다시 실행한다.
+- Claude Code·Codex의 내부 파일과 터미널의 AppleScript 사전은 공식 API가 아니라서 업데이트로 바뀌면 깨질 수 있다.
 
 ## 라이선스
 
